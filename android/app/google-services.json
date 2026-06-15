@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "629219178675",
+    "project_id": "herox-47030",
+    "storage_bucket": "herox-47030.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:629219178675:android:862538d096f6eb3add98c6",
+        "android_client_info": {
+          "package_name": "com.example.herox"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB8ylv7F3w4a-sBPDkzmiD-qWkjU17gjPM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

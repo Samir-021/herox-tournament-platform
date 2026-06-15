@@ -1,0 +1,294 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUserDoc(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Check if user has administrative rights
+    function isAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             getUserData().role == 'admin';
+    }
+
+    // Check if user access is suspended
+    function isBanned() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/bans/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/bans/$(request.auth.uid)).data.banned == true &&
+             (
+               !('expiryDate' in get(/databases/$(database)/documents/bans/$(request.auth.uid)).data) ||
+               get(/databases/$(database)/documents/bans/$(request.auth.uid)).data.expiryDate == null ||
+               get(/databases/$(database)/documents/bans/$(request.auth.uid)).data.expiryDate > request.time
+             );
+    }
+
+    // Admins can read and write all documents ONLY if they themselves are not banned
+    match /{document=**} {
+      allow read, write: if isAuthenticated() && !isBanned() && isAdmin();
+    }
+
+    // Users collection rules
+    match /users/{userId} {
+      allow read: if isAuthenticated() && !isBanned();
+      // Allow users to create their own profile, default role must be 'player'
+      allow create: if isAuthenticated() && !isBanned() && isUserDoc(userId) && 
+                      request.resource.data.role == 'player' &&
+                      request.resource.data.email is string &&
+                      request.resource.data.name is string &&
+                      request.resource.data.name.size() <= 100;
+      // Allow users to update their own profile, but they cannot change their role!
+      allow update: if isAuthenticated() && !isBanned() && isUserDoc(userId) && 
+                      (request.resource.data.role == resource.data.role || isAdmin()) &&
+                      // Enforce data schema on update
+                      (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['freeFireUid', 'gameName']) || 
+                        (
+                          request.resource.data.freeFireUid is string &&
+                          request.resource.data.freeFireUid.size() <= 30 &&
+                          request.resource.data.gameName is string &&
+                          request.resource.data.gameName.size() <= 50 &&
+                          (
+                            (request.resource.data.lastEditDate != resource.data.lastEditDate && request.resource.data.editCountToday == 1) ||
+                            (request.resource.data.lastEditDate == resource.data.lastEditDate && 
+                             request.resource.data.editCountToday == resource.data.editCountToday + 1 &&
+                             request.resource.data.editCountToday <= 2)
+                          )
+                        )
+                      );
+      allow delete: if isAuthenticated() && isUserDoc(userId);
+    }
+
+    // Tournaments rules
+    match /tournaments/{tournamentId} {
+      allow read: if isAuthenticated() && !isBanned();
+      allow create: if isAuthenticated() && !isBanned() && 
+                    request.resource.data.title is string &&
+                    request.resource.data.title.size() <= 100 &&
+                    request.resource.data.entryFee is int &&
+                    request.resource.data.entryFee >= 0 &&
+                    request.resource.data.totalSlots is int &&
+                    request.resource.data.totalSlots > 0 &&
+                    request.resource.data.filledSlots == 0 &&
+                    request.resource.data.prizePool is string &&
+                    request.resource.data.status in ['upcoming', 'live', 'full', 'ended'] &&
+                    request.resource.data.createdBy == request.auth.uid;
+      
+      allow update: if isAuthenticated() && !isBanned() && 
+                    (
+                      isAdmin() || 
+                      resource.data.createdBy == request.auth.uid ||
+                      (
+                        // Joining a tournament (increment filledSlots by 1)
+                        request.resource.data.title == resource.data.title &&
+                        request.resource.data.entryFee == resource.data.entryFee &&
+                        request.resource.data.totalSlots == resource.data.totalSlots &&
+                        request.resource.data.prizePool == resource.data.prizePool &&
+                        request.resource.data.createdBy == resource.data.createdBy &&
+                        request.resource.data.filledSlots == resource.data.filledSlots + 1 &&
+                        (
+                          request.resource.data.status == resource.data.status ||
+                          (request.resource.data.filledSlots == resource.data.totalSlots && request.resource.data.status == 'full')
+                        )
+                      )
+                    );
+      
+      allow delete: if isAuthenticated() && !isBanned() && 
+                    (isAdmin() || resource.data.createdBy == request.auth.uid);
+
+      // Participants subcollection
+      match /participants/{participantId} {
+        allow read: if isAuthenticated() && !isBanned();
+        allow create: if isAuthenticated() && !isBanned() && participantId == request.auth.uid;
+        allow update, delete: if isAuthenticated() && !isBanned() && (
+                                isAdmin() || 
+                                get(/databases/$(database)/documents/tournaments/$(tournamentId)).data.createdBy == request.auth.uid
+                              );
+      }
+    }
+
+    // Join Requests rules
+    match /join_requests/{requestId} {
+      allow read: if isAuthenticated() && !isBanned() && 
+                    (resource.data.userId == request.auth.uid || isAdmin() ||
+                     get(/databases/$(database)/documents/tournaments/$(resource.data.tournamentId)).data.createdBy == request.auth.uid);
+      
+      // Creating a request: status must be pending or approved, userId must be requesting user, enforce schema
+      allow create: if isAuthenticated() && !isBanned() && 
+                      request.resource.data.userId == request.auth.uid &&
+                      (request.resource.data.status == 'pending' || request.resource.data.status == 'approved') &&
+                      request.resource.data.tournamentId is string &&
+                      request.resource.data.tournamentTitle is string &&
+                      request.resource.data.playerName is string &&
+                      request.resource.data.playerName.size() <= 100 &&
+                      request.resource.data.gameName is string &&
+                      request.resource.data.gameName.size() <= 50 &&
+                      request.resource.data.ffUid is string &&
+                      request.resource.data.ffUid.size() <= 30 &&
+                      (request.resource.data.paymentDetails == '' || request.resource.data.paymentDetails == 'Auto-approved (Direct Entry)') &&
+                      request.resource.data.screenshotUrl == '';
+      
+      // Updating a request: players can only upload screenshot, admins/creators can do anything
+      allow update: if isAuthenticated() && !isBanned() && 
+                      (
+                        isAdmin() ||
+                        get(/databases/$(database)/documents/tournaments/$(resource.data.tournamentId)).data.createdBy == request.auth.uid ||
+                        (
+                          resource.data.userId == request.auth.uid &&
+                          request.resource.data.userId == resource.data.userId &&
+                          request.resource.data.tournamentId == resource.data.tournamentId &&
+                          resource.data.status == 'waiting_payment' &&
+                          request.resource.data.status == 'verification_pending' &&
+                          request.resource.data.screenshotUrl is string &&
+                          request.resource.data.screenshotUrl != null &&
+                          request.resource.data.screenshotUrl != ''
+                        )
+                      );
+      allow delete: if isAuthenticated() && !isBanned() && (
+                      isAdmin() || 
+                      get(/databases/$(database)/documents/tournaments/$(resource.data.tournamentId)).data.createdBy == request.auth.uid
+                    );
+    }
+
+    // Reports rules
+    match /reports/{reportId} {
+      allow read: if isAdmin() && !isBanned();
+      allow create: if isAuthenticated() && !isBanned() && 
+                      request.resource.data.fromUserId == request.auth.uid &&
+                      request.resource.data.toUserId != request.auth.uid &&
+                      request.resource.data.reason is string &&
+                      request.resource.data.reason.size() > 0 &&
+                      request.resource.data.reason.size() <= 500 &&
+                      request.resource.data.tournamentId is string &&
+                      request.resource.data.status == 'pending';
+      allow update, delete: if isAdmin() && !isBanned();
+    }
+
+    // Bans rules
+    match /bans/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || !isBanned());
+      allow write: if isAdmin() && !isBanned() &&
+                    request.resource.data.banned == true &&
+                    request.resource.data.reason is string &&
+                    request.resource.data.reason.size() > 0 &&
+                    request.resource.data.reason.size() <= 500 &&
+                    request.resource.data.bannedBy == request.auth.uid;
+      // Allow user to submit an appeal (update appealStatus and appealText)
+      allow update: if isAuthenticated() && request.auth.uid == userId &&
+                      request.resource.data.banned == resource.data.banned &&
+                      request.resource.data.reason == resource.data.reason &&
+                      request.resource.data.bannedBy == resource.data.bannedBy &&
+                      request.resource.data.appealStatus == 'pending' &&
+                      request.resource.data.appealText is string &&
+                      request.resource.data.appealText.size() <= 1000;
+    }
+
+    // Rooms rules (distribution of Room ID & Password to approved participants)
+    match /rooms/{roomId} {
+      allow read: if isAuthenticated() && !isBanned() && (
+                    isAdmin() || 
+                    exists(/databases/$(database)/documents/tournaments/$(resource.data.tournamentId)/participants/$(request.auth.uid))
+                  );
+      allow write: if isAuthenticated() && !isBanned() && (
+                    isAdmin() ||
+                    get(/databases/$(database)/documents/tournaments/$(request.resource.data.tournamentId)).data.createdBy == request.auth.uid
+                  ) &&
+                  request.resource.data.tournamentId is string &&
+                  request.resource.data.roomId is string &&
+                  request.resource.data.roomPassword is string;
+    }
+
+    // Match Results rules
+    match /match_results/{resultId} {
+      allow read: if isAuthenticated() && !isBanned();
+      allow write: if isAuthenticated() && !isBanned() && (
+                     isAdmin() || 
+                     get(/databases/$(database)/documents/tournaments/$(request.resource.data.tournamentId)).data.createdBy == request.auth.uid
+                   );
+    }
+
+    // Leaderboards rules
+    match /leaderboards/{userId} {
+      allow read: if isAuthenticated() && !isBanned();
+      allow write: if isAuthenticated() && !isBanned();
+    }
+
+    // Player Statistics rules
+    match /player_stats/{userId} {
+      allow read: if isAuthenticated() && !isBanned();
+      allow write: if isAuthenticated() && !isBanned();
+    }
+
+    // Wallet balance tracking rules
+    match /wallets/{userId} {
+      allow read: if isAuthenticated() && !isBanned() && (request.auth.uid == userId || isAdmin());
+      allow create: if isAuthenticated() && !isBanned() && request.auth.uid == userId &&
+                      request.resource.data.balance == 0.0 &&
+                      request.resource.data.winnings == 0.0;
+      allow update: if isAuthenticated() && !isBanned() && (
+                      isAdmin() ||
+                      (
+                        request.auth.uid == userId &&
+                        request.resource.data.winnings == resource.data.winnings &&
+                        request.resource.data.balance < resource.data.balance
+                      )
+                    );
+      allow delete: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Wallet transaction tracking rules
+    match /wallet_transactions/{txId} {
+      allow read: if isAuthenticated() && !isBanned() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && !isBanned() && (
+                      isAdmin() ||
+                      (
+                        request.resource.data.userId == request.auth.uid &&
+                        request.resource.data.type == 'entry_fee' &&
+                        request.resource.data.amount < 0
+                      )
+                    );
+      allow update, delete: if isAdmin() && !isBanned();
+    }
+
+    // Deposit Requests rules (Admin-approved credit system)
+    match /deposit_requests/{reqId} {
+      allow read: if isAuthenticated() && !isBanned() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && !isBanned() && 
+                      request.resource.data.userId == request.auth.uid &&
+                      request.resource.data.status == 'pending' &&
+                      request.resource.data.amount is number &&
+                      request.resource.data.amount > 0 &&
+                      request.resource.data.screenshotUrl is string &&
+                      request.resource.data.screenshotUrl != '';
+      allow update: if isAdmin() && !isBanned();
+      allow delete: if false;
+    }
+
+    // Admin Action Logs
+    match /admin_audit_logs/{logId} {
+      allow read: if isAdmin() && !isBanned();
+      allow create: if isAdmin() && !isBanned() &&
+                      request.resource.data.adminUid == request.auth.uid &&
+                      request.resource.data.adminEmail is string &&
+                      request.resource.data.action is string &&
+                      request.resource.data.details is string;
+      allow update, delete: if false;
+    }
+
+    // Stats rules
+    match /metadata/{docId} {
+      allow read: if isAuthenticated() && !isBanned();
+      allow write: if isAdmin() && !isBanned();
+    }
+  }
+}

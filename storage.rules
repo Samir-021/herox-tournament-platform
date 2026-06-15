@@ -1,0 +1,44 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             firestore.exists(/databases/(default)/documents/users/$(request.auth.uid)) &&
+             firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isBanned() {
+      return isAuthenticated() && 
+             firestore.exists(/databases/(default)/documents/bans/$(request.auth.uid)) &&
+             firestore.get(/databases/(default)/documents/bans/$(request.auth.uid)).data.banned == true;
+    }
+
+    // Admins can read/write everything
+    match /{allPaths=**} {
+      allow read, write: if isAuthenticated() && !isBanned() && isAdmin();
+    }
+
+    // Payment screenshots rules
+    match /payment_screenshots/{requestId} {
+      // Allow read if user owns the request or is admin
+      allow read: if isAuthenticated() && !isBanned() && 
+                    (
+                      firestore.exists(/databases/(default)/documents/join_requests/$(requestId)) &&
+                      firestore.get(/databases/(default)/documents/join_requests/$(requestId)).data.userId == request.auth.uid
+                    );
+                    
+      // Allow write if user owns the request, status is waiting_payment, size < 5MB and is image
+      allow write: if isAuthenticated() && !isBanned() && 
+                     firestore.exists(/databases/(default)/documents/join_requests/$(requestId)) &&
+                     firestore.get(/databases/(default)/documents/join_requests/$(requestId)).data.userId == request.auth.uid &&
+                     firestore.get(/databases/(default)/documents/join_requests/$(requestId)).data.status == 'waiting_payment' &&
+                     request.resource.size < 5 * 1024 * 1024 &&
+                     request.resource.contentType.matches('image/.*');
+    }
+  }
+}
